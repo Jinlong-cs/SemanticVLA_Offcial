@@ -25,6 +25,7 @@ QWEN_IMAGE_SIZE = 256
 QWEN_PIXEL_SHAPE = (512, 1536)
 QWEN_IMAGE_GRID_THW = ((1, 16, 16), (1, 16, 16))
 BACKBONE_OUTPUT_SCALE = 128.0
+QWENVLA_INFERENCE_STEPS = 10
 
 
 class QwenVlaActionStep(torch.nn.Module):
@@ -379,6 +380,7 @@ def export_qwenvla(args: argparse.Namespace) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     model = baseframework.from_pretrained(str(checkpoint)).to("cuda").eval()
+    model.action_model.num_inference_timesteps = QWENVLA_INFERENCE_STEPS
     model.qwen_vl_interface.model.config._attn_implementation = "eager"
     model.qwen_vl_interface.model.config.text_config._attn_implementation = "eager"
     if args.dtype == "float16":
