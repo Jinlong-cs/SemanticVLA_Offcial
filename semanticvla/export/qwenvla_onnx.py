@@ -26,6 +26,7 @@ QWEN_PIXEL_SHAPE = (512, 1536)
 QWEN_IMAGE_GRID_THW = ((1, 16, 16), (1, 16, 16))
 BACKBONE_OUTPUT_SCALE = 128.0
 QWENVLA_INFERENCE_STEPS = 10
+EXPORT_DTYPE = torch.float16
 
 
 class QwenVlaActionStep(torch.nn.Module):
@@ -347,7 +348,7 @@ def _export_backbone(model: torch.nn.Module, output_dir: Path, prompt_len: int) 
     )
 
 
-def _export_action_step(model: torch.nn.Module, output_dir: Path, dtype: torch.dtype, prompt_len: int) -> None:
+def _export_action_step(model: torch.nn.Module, output_dir: Path, prompt_len: int) -> None:
     action_model = model.action_model.eval()
     wrapper = QwenVlaActionStep(action_model).eval()
     onnx_dir = output_dir / "onnx"
@@ -372,19 +373,14 @@ def _export_action_step(model: torch.nn.Module, output_dir: Path, dtype: torch.d
     )
 
 
-def export_qwenvla(args: argparse.Namespace) -> None:
-    checkpoint = Path(args.checkpoint)
-    base_vlm = Path(args.base_vlm)
-    bddl_root = Path(args.libero_bddl_root)
-    output_dir = Path(args.output_dir)
+def export_qwenvla(*, checkpoint: Path, base_vlm: Path, bddl_root: Path, output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     model = baseframework.from_pretrained(str(checkpoint)).to("cuda").eval()
     model.action_model.num_inference_timesteps = QWENVLA_INFERENCE_STEPS
     model.qwen_vl_interface.model.config._attn_implementation = "eager"
     model.qwen_vl_interface.model.config.text_config._attn_implementation = "eager"
-    if args.dtype == "float16":
-        model.qwen_vl_interface.model.to(torch.float16)
+    model.qwen_vl_interface.model.to(EXPORT_DTYPE)
     for parameter in model.parameters():
         parameter.requires_grad_(False)
 
@@ -392,24 +388,25 @@ def export_qwenvla(args: argparse.Namespace) -> None:
     shutil.copy2(checkpoint.parents[1] / "dataset_statistics.json", output_dir / "dataset_statistics.json")
     _copy_qwen_assets(base_vlm, output_dir)
     prompt_len = _write_prompt_cache(model, bddl_root, output_dir)
-    action_dtype = torch.float16 if args.dtype == "float16" else torch.float32
-    _write_initial_actions(model, output_dir, action_dtype)
+    _write_initial_actions(model, output_dir, EXPORT_DTYPE)
     _write_manifest(model, checkpoint, base_vlm, output_dir, prompt_len)
-    if args.export_backbone:
-        _export_backbone(model, output_dir, prompt_len)
-    _export_action_step(model, output_dir, action_dtype, prompt_len)
+    _export_backbone(model, output_dir, prompt_len)
+    _export_action_step(model, output_dir, prompt_len)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--base-vlm", required=True)
-    parser.add_argument("--libero-bddl-root", required=True)
-    parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--dtype", choices=("float16", "float32"), default="float16")
-    parser.add_argument("--export-backbone", action="store_true")
+    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--base-vlm", type=Path, required=True)
+    parser.add_argument("--libero-bddl-root", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
-    export_qwenvla(args)
+    export_qwenvla(
+        checkpoint=args.checkpoint,
+        base_vlm=args.base_vlm,
+        bddl_root=args.libero_bddl_root,
+        output_dir=args.output_dir,
+    )
 
 
 if __name__ == "__main__":
