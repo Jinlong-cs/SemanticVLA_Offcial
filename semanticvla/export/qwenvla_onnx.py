@@ -59,6 +59,26 @@ class QwenVlaActionStep(torch.nn.Module):
         return actions + (1.0 / action_model.num_inference_timesteps) * pred_velocity
 
 
+class QwenVlaActionLoop(torch.nn.Module):
+    def __init__(self, action_model: torch.nn.Module) -> None:
+        super().__init__()
+        self.step = QwenVlaActionStep(action_model)
+        self.steps = int(action_model.num_inference_timesteps)
+        timestep_values = torch.arange(self.steps, dtype=torch.long) * int(action_model.num_timestep_buckets)
+        timestep_values = torch.div(timestep_values, self.steps, rounding_mode="floor")
+        self.register_buffer("timestep_values", timestep_values, persistent=False)
+
+    def forward(
+        self,
+        last_hidden: torch.Tensor,
+        actions: torch.Tensor,
+    ) -> torch.Tensor:
+        for step in range(self.steps):
+            timestep = self.timestep_values[step].reshape(1).to(device=actions.device)
+            actions = self.step(last_hidden, actions, timestep)
+        return actions
+
+
 class QwenVlaBackbone(torch.nn.Module):
     def __init__(self, qwen_vl_interface: torch.nn.Module) -> None:
         super().__init__()
@@ -293,9 +313,21 @@ def _write_manifest(
             "sample_seed": 0,
             "initial_actions": "initial_actions.npz",
         },
+        "loop": {
+            "type": "flow_matching",
+            "step_stage": "action_step",
+            "stage": "action_loop",
+            "steps": int(action_model.num_inference_timesteps),
+            "timestep_buckets": [
+                int((step / float(action_model.num_inference_timesteps)) * action_model.num_timestep_buckets)
+                for step in range(int(action_model.num_inference_timesteps))
+            ],
+            "dt": 1.0 / float(action_model.num_inference_timesteps),
+        },
         "onnx": {
             "backbone": "onnx/backbone.onnx",
             "action_step": "onnx/action_step.onnx",
+            "action_loop": "onnx/action_loop.onnx",
         },
     }
     (output_dir / "export_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
@@ -373,6 +405,30 @@ def _export_action_step(model: torch.nn.Module, output_dir: Path, prompt_len: in
     )
 
 
+def _export_action_loop(model: torch.nn.Module, output_dir: Path, prompt_len: int) -> None:
+    action_model = model.action_model.eval()
+    wrapper = QwenVlaActionLoop(action_model).eval()
+    onnx_dir = output_dir / "onnx"
+    onnx_dir.mkdir(parents=True, exist_ok=True)
+
+    hidden_dim = int(model.qwen_vl_interface.model.config.hidden_size)
+    action_horizon = int(action_model.action_horizon)
+    action_dim = int(action_model.action_dim)
+    seq_len = prompt_len
+    last_hidden = torch.zeros((1, seq_len, hidden_dim), dtype=torch.float32, device="cuda")
+    actions = torch.zeros((1, action_horizon, action_dim), dtype=torch.float32, device="cuda")
+
+    torch.onnx.export(
+        wrapper,
+        (last_hidden, actions),
+        str(onnx_dir / "action_loop.onnx"),
+        input_names=["last_hidden", "actions"],
+        output_names=["actions_out"],
+        opset_version=ONNX_OPSET,
+        do_constant_folding=True,
+    )
+
+
 def export_qwenvla(*, checkpoint: Path, base_vlm: Path, bddl_root: Path, output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -392,6 +448,7 @@ def export_qwenvla(*, checkpoint: Path, base_vlm: Path, bddl_root: Path, output_
     _write_manifest(model, checkpoint, base_vlm, output_dir, prompt_len)
     _export_backbone(model, output_dir, prompt_len)
     _export_action_step(model, output_dir, prompt_len)
+    _export_action_loop(model, output_dir, prompt_len)
 
 
 def main() -> None:
